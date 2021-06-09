@@ -2,6 +2,8 @@
 
 #include <torch/csrc/jit/frontend/sugared_value.h>
 
+#include <torch/csrc/jit/python/pybind_utils.h>
+
 #include <fmt/format.h>
 
 namespace torch {
@@ -14,15 +16,29 @@ py::object ScriptClass::__call__(py::args args, py::kwargs kwargs) {
   auto instance =
       Object(at::ivalue::Object::create(class_type_, /*numSlots=*/1));
   Function* init_fn = instance.type()->findMethod("__init__");
-  TORCH_CHECK(
-      init_fn,
-      fmt::format(
-          "Custom C++ class: '{}' does not have an '__init__' method bound. "
-          "Did you forget to add '.def(torch::init<...>)' to its registration?",
-          instance.type()->repr_str()));
+  auto input_args = std::move(args);
+  auto input_kwargs = std::move(kwargs);
+  if (!init_fn) {
+    if (auto methods = instance.type()->findOverloadedMethod("__init__")) {
+      auto resolved_init_method = match_overloaded_methods(
+          instance._ivalue(), "__init__", input_args, input_kwargs);
+      invokeScriptMethodFromPython(
+          resolved_init_method.value(),
+          std::move(input_args),
+          std::move(input_kwargs));
+      return py::cast(instance);
+    }
+    TORCH_CHECK(
+        init_fn,
+        fmt::format(
+            "Custom C++ class: '{}' does not have an '__init__' method bound. "
+            "Did you forget to add '.def(torch::init<...>)' to its registration?",
+            instance.type()->repr_str()));
+  }
+
   Method init_method(instance._ivalue(), init_fn);
-  // NOLINTNEXTLINE(performance-move-const-arg)
-  invokeScriptMethodFromPython(init_method, std::move(args), std::move(kwargs));
+  invokeScriptMethodFromPython(
+      init_method, std::move(input_args), std::move(input_kwargs));
   return py::cast(instance);
 }
 
