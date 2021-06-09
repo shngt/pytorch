@@ -58,6 +58,7 @@ Reducer::Reducer(
       gradient_as_bucket_view_(gradient_as_bucket_view),
       local_used_maps_reduced_(false),
       num_iterations_(0),
+      num_backward_calls_(0),
       num_buckets_ready_(0),
       has_rebuilt_bucket_(false),
       bucket_bytes_cap_(bucket_bytes_cap),
@@ -233,12 +234,12 @@ bool Reducer::dynamic_graph_find_unused() {
   return !static_graph_ && find_unused_parameters_;
 }
 
-bool Reducer::static_graph_first_iteration() {
-  return static_graph_ && num_iterations_ == 1;
+bool Reducer::static_graph_first_bwd() {
+  return static_graph_ && num_backward_calls_ == 1;
 }
 
-bool Reducer::static_graph_after_first_iteration() {
-  return static_graph_ && num_iterations_ > 1;
+bool Reducer::static_graph_after_first_bwd() {
+  return static_graph_ && num_backward_calls_ > 1;
 }
 
 void Reducer::initialize_local_used_map() {
@@ -336,8 +337,7 @@ void Reducer::mark_variable_ready_dense(size_t variable_index) {
       // Gradient is undefined. When find_unused_parameters=True, ensure it is
       // not marked as locally used, otherwise we will be allreducing zero's
       // instead of not touching .grad field of parameter.
-      if (this->dynamic_graph_find_unused() ||
-          this->static_graph_first_iteration()) {
+      if (this->dynamic_graph_find_unused() || this->static_graph_first_bwd()) {
         REDUCER_CHECK(
             local_used_maps_[0][variable_index].item<int>() == 0,
             logger_,
@@ -518,7 +518,7 @@ void Reducer::autograd_hook(size_t index) {
   }
 
   // See Note [Skip allreducing local_used_maps_dev]
-  if (dynamic_graph_find_unused() || static_graph_first_iteration()) {
+  if (dynamic_graph_find_unused() || static_graph_first_bwd()) {
     // Since it gets here, this param has been used for this iteration. We want
     // to mark it in local_used_maps_. During no_sync session, the same var can
     // be set multiple times, which is OK as does not affect correctness. As
@@ -536,7 +536,7 @@ void Reducer::autograd_hook(size_t index) {
     });
   }
 
-  if (static_graph_first_iteration()) {
+  if (static_graph_first_bwd()) {
     numGradHooksTriggeredMap_[index] += 1;
     return;
   }
@@ -563,7 +563,7 @@ void Reducer::autograd_hook(size_t index) {
   // will be broadcasted and initialized.
   // If it is static graph, after 1st iteration, check if a variable
   // is ready for communication based on numGradHooksTriggeredMap_.
-  if (static_graph_after_first_iteration()) {
+  if (static_graph_after_first_bwd()) {
     REDUCER_CHECK(
         numGradHooksTriggeredMapPerIteration_[index] > 0,
         logger_,
@@ -779,7 +779,7 @@ void Reducer::mark_variable_ready(size_t variable_index) {
       }
       // Check that all buckets were completed and had their work kicked off.
       TORCH_INTERNAL_ASSERT(next_bucket_ == buckets_.size());
-      if (static_graph_after_first_iteration() && should_rebuild_buckets()) {
+      if (static_graph_after_first_bwd() && should_rebuild_buckets()) {
         for (const auto& unused_index : unused_parameters_) {
           push_rebuilt_params(unused_index);
         }
@@ -1181,6 +1181,7 @@ void Reducer::search_unused_parameters(
 void Reducer::prepare_for_backward(
     const std::vector<torch::autograd::Variable>& outputs) {
   std::lock_guard<std::mutex> lock(mutex_);
+  ++num_backward_calls_;
 
   cpu_timer_.backward_compute_start_time = current_time_in_nanos();
   if (should_collect_runtime_stats()) {
@@ -1402,7 +1403,7 @@ void Reducer::finalize_backward() {
   }
 
   // See Note [Skip allreducing local_used_maps_dev]
-  if (dynamic_graph_find_unused() || static_graph_first_iteration()) {
+  if (dynamic_graph_find_unused() || static_graph_first_bwd()) {
     // Due to the lazy wait, it is possible that reduction of the current
     // iteration is still going when the one for next iteration gets kicked off.
     // For such case, we want to wait explicitly to make sure the reduction does

@@ -25,6 +25,7 @@ from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel.distributed import _dump_DDP_relevant_env_vars
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.distributed.distributed_c10d import get_world_size, _get_default_group, AllreduceOptions, GroupMember
@@ -6630,6 +6631,9 @@ class DistributedTest:
                     loss = get_loss(out)
                     loss.backward()
                     self._model_step(model)
+                    # Test non 1:1 calls to fwd/backward to ensure
+                    # https://github.com/pytorch/pytorch/issues/58111 is fixed.
+                    model_static_graph(inp, output_type=output_type)
                     out_static = model_static_graph(inp, output_type=output_type)
                     self.assertTrue(isinstance(out_static, type_mapping[output_type]))
                     loss_static = get_loss(out_static)
@@ -6639,3 +6643,119 @@ class DistributedTest:
                         model.parameters(), model_static_graph.parameters()
                     ):
                         self.assertEqual(p, p_static)
+
+        def _test_ddp_bwd_with_retain_graph(self, static_graph, find_unused_parameters):
+            # Test adapted from https://github.com/pytorch/pytorch/issues/47260.
+            class ToyModel(nn.Module):
+                def __init__(self):
+                    super(ToyModel, self).__init__()
+                    self.net1 = nn.Linear(10, 10, bias=False)
+
+                def forward(self, x):
+                    return self.net1(x)
+
+            rank = self.rank
+            torch.cuda.set_device(rank)
+            model = ToyModel().cuda(torch.cuda.current_device())
+            local_model = copy.deepcopy(model)
+            ddp_model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[torch.cuda.current_device()],
+                find_unused_parameters=find_unused_parameters,
+            )
+            if static_graph:
+                ddp_model._set_static_graph()
+
+            loss_fn = nn.MSELoss()
+            optimizer = optim.SGD(ddp_model.parameters(), lr=1)
+            local_optimizer = optim.SGD(local_model.parameters(), lr=1)
+            optimizer.zero_grad()
+            local_optimizer.zero_grad()
+
+            outputs = {}
+            outputs_local = {}
+            for i in range(3):
+                inp = torch.rand(20, 10).cuda(torch.cuda.current_device())
+                idx = str(i)
+                outputs[idx] = ddp_model(inp).sum(axis=1).unsqueeze(dim=1)
+                outputs_local[idx] = local_model(inp).sum(axis=1).unsqueeze(dim=1)
+
+            labels = torch.rand(20, 1).cuda(torch.cuda.current_device())
+
+            for i in range(3):
+                if i < 2:
+                    loss_fn(outputs[str(i)], labels).backward(retain_graph=True)
+                    loss_fn(outputs_local[str(i)], labels).backward(retain_graph=True)
+                else:
+                    loss_fn(outputs[str(i)], labels).backward()
+                    loss_fn(outputs_local[str(i)], labels).backward()
+
+                dist_grad_tensor = torch.cat(
+                    [param.grad for param in ddp_model.module.parameters()]
+                )
+                local_grad_tensor = torch.cat(
+                    [param.grad for param in local_model.parameters()]
+                )
+                self.assertEqual(dist_grad_tensor, local_grad_tensor)
+
+        @skip_if_lt_x_gpu(2)
+        @unittest.skipIf(
+            BACKEND != "nccl" and BACKEND != "gloo",
+            "Only Nccl & Gloo backend support DistributedDataParallel",
+        )
+        def test_ddp_bwd_with_retain_graph(self):
+            self._test_ddp_bwd_with_retain_graph(
+                static_graph=False, find_unused_parameters=False
+            )
+            self._test_ddp_bwd_with_retain_graph(
+                static_graph=False, find_unused_parameters=True
+            )
+
+        @skip_if_lt_x_gpu(2)
+        @unittest.skipIf(
+            BACKEND != "nccl" and BACKEND != "gloo",
+            "Only Nccl & Gloo backend support DistributedDataParallel",
+        )
+        def test_static_ddp_bwd_with_retain_graph(self):
+            self._test_ddp_bwd_with_retain_graph(
+                static_graph=True, find_unused_parameters=False
+            )
+            self._test_ddp_bwd_with_retain_graph(
+                static_graph=True, find_unused_parameters=True
+            )
+
+        @skip_if_lt_x_gpu(2)
+        @unittest.skipIf(
+            BACKEND != "nccl" and BACKEND != "gloo",
+            "Only Nccl & Gloo backend support DistributedDataParallel",
+        )
+        def test_static_ddp_with_retain_graph_single_fwd(self):
+            # Ensures that if we do 1 forward pass immediately followed by 2
+            # backward passes, there is no issue. In particular, verifies that
+            # delay allreduce is enqueued only once.
+            rank = self.rank
+            model = TwoLinLayerNet().cuda(rank)
+            model_ddp = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[rank]
+            )
+            model_ddp._set_static_graph()
+            model_local = copy.deepcopy(model)
+            inp = torch.randn(2, 10, device=rank)
+            # Run single forward pass followed by 2 calls to backward with
+            # retain_graph=True.
+            out_ddp = model_ddp(inp)
+            out_ddp = torch.add(out_ddp[0], out_ddp[1]).sum()
+            out_local = model_local(inp)
+            out_local = torch.add(out_local[0], out_local[1]).sum()
+            out_ddp.backward(retain_graph=True)
+            out_ddp.backward()
+            out_local.backward(retain_graph=True)
+            out_local.backward()
+            dist_grad_tensor = torch.cat(
+                [param.grad for param in model_ddp.module.parameters()]
+            )
+            local_grad_tensor = torch.cat(
+                [param.grad for param in model_local.parameters()]
+            )
+            self.assertEqual(dist_grad_tensor, local_grad_tensor)
