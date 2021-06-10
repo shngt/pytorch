@@ -9,3 +9,4 @@ from .sparsifier.weight_norm_sparsifier import WeightNormSparsifier
 
 # Scheduler
 from .scheduler.base_scheduler import BaseScheduler
+from .scheduler.lambda_scheduler import LambdaSL
